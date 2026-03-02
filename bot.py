@@ -4,7 +4,7 @@ import asyncio
 import logging
 from dotenv import load_dotenv
 # pyright: reportPrivateImportUsage=false
-import google.generativeai as genai
+from google import genai
 from telegram import Update
 from telegram.ext import (
     ApplicationBuilder,
@@ -32,8 +32,7 @@ if not TELEGRAM_TOKEN:
 if not GEMINI_API_KEY:
     raise ValueError("Missing GEMINI_API_KEY")
 
-genai.configure(api_key=GEMINI_API_KEY)
-model = genai.GenerativeModel("gemini-1.5-flash")
+client = genai.Client(api_key=GEMINI_API_KEY)
 
 # =========================
 # LOGGING
@@ -43,6 +42,7 @@ logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
+logging.getLogger("httpx").setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 # =========================
@@ -51,7 +51,7 @@ logger = logging.getLogger(__name__)
 
 user_sessions = {}
 user_scores = {}
-
+user_locks: dict[int, asyncio.Lock] = {}
 # =========================
 # COMMANDS
 # =========================
@@ -68,7 +68,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 # AI PROBLEM GENERATION
 # =========================
 
-async def generate_problem():
+async def generate_problem() -> dict | None:
     prompt = """
 Generate one SAT-style algebra problem.
 
@@ -76,12 +76,7 @@ Return ONLY valid JSON in this format:
 
 {
   "question": "...",
-  "choices": {
-    "A": "...",
-    "B": "...",
-    "C": "...",
-    "D": "..."
-  },
+  "choices": {"A":"...","B":"...","C":"...","D":"..."},
   "correct_answer": "A",
   "explanation": "step-by-step explanation"
 }
@@ -92,41 +87,25 @@ Difficulty: Medium.
 
     try:
         loop = asyncio.get_running_loop()
-
-        # Run Gemini in thread pool (prevents bot freezing)
-        response = await loop.run_in_executor(
+        resp = await loop.run_in_executor(
             None,
-            lambda: model.generate_content(prompt)
+            lambda: client.models.generate_content(
+                model="gemini-2.5-flash",
+                contents=prompt,
+                config={"response_mime_type": "application/json"},
+            ),
         )
 
-        text = response.text.strip()
-        text = text.replace("```json", "").replace("```", "").strip()
+        if not resp.text:
+            logger.error("Empty response from Gemini")
+            return None
 
-        data = json.loads(text)
-
-        # Validate structure
-        required_keys = ["question", "choices", "correct_answer", "explanation"]
-        if not all(key in data for key in required_keys):
-            raise ValueError("Invalid JSON structure")
-
+        data = json.loads(resp.text)
         return data
 
-    except Exception as e:
-        logger.error(f"Gemini Error: {e}")
-
-        # Fallback question
-        return {
-            "question": "If 2x + 3 = 11, what is x?",
-            "choices": {
-                "A": "3",
-                "B": "4",
-                "C": "5",
-                "D": "6"
-            },
-            "correct_answer": "B",
-            "explanation": "2x + 3 = 11 → 2x = 8 → x = 4"
-        }
-
+    except Exception:
+        logger.exception("Gemini generate_problem failed")
+        return None
 # =========================
 # /problem COMMAND
 # =========================
@@ -147,7 +126,23 @@ async def problem(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.chat.send_action("typing")
 
     data = await generate_problem()
+    lock = user_locks.setdefault(user_id, asyncio.Lock())
+    async with lock:
+        if user_id in user_sessions:
+            await update.message.reply_text("You already have a question. Answer it first!")
+            return
 
+        await update.message.chat.send_action("typing")
+        data = await generate_problem()
+        if not data:
+            await update.message.reply_text("Gemini failed to generate a problem. Try again.")
+            return
+
+        user_sessions[user_id] = data
+    
+    if not data:
+        await update.message.reply_text("Gemini failed to generate a problem. Try again in a moment.")
+        return
     user_sessions[user_id] = data
 
     question_text = data["question"]
@@ -207,6 +202,13 @@ async def check_answer(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Clear active question
     del user_sessions[user_id]
 
+async def on_error(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    logger.exception("Unhandled error:", exc_info=context.error)
+    # Try to notify user if possible
+    if isinstance(update, Update) and update.effective_message:
+        await update.effective_message.reply_text(
+            "Something broke while generating the problem. Try /problem again."
+        )
 # =========================
 # MAIN
 # =========================
@@ -217,6 +219,7 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("problem", problem))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check_answer))
+    app.add_error_handler(on_error)
 
     logger.info("Bot is running...")
     app.run_polling()
